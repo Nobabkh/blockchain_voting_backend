@@ -1,0 +1,1 @@
+PDFBASEPATH = '/app/data'

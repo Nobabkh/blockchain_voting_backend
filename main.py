@@ -1,143 +1,137 @@
-# Load environment variables first
-from dotenv import load_dotenv
-from typing import Optional
-from datetime import datetime
-import time
-import json
-import os
-
-# Fastapi imports
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
-from fastapi.security import HTTPBearer
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
-from fastapi.openapi.utils import get_openapi
-# from database.entity.User import User
+from pydantic import BaseModel
+from typing import List
+import requests
+from blockchain import Blockchain, Vote, Block, Candidate, VoteRequest
+import datetime
+from collections import defaultdict
 
-# end Fastapi import 
-
-from routes.auth_routes import auth_router
-from routes.code_generator_routes import code_route
-from routes.user_routes import user_router_v1
-from routes.screenshot import screenshoot_router
-from routes.project_routes import project_router_v1
-from routes.payment_routes import payment_route
-from routes.core_routes import core_route
-
-# load .env
-load_dotenv()
-
-# database migrate and seed
-# from database.databaseConfig.migrate import Migrate
-
-# services
-
-
-
-
-
-
-max_requests_per_minute = 60
-block_duration = 300  # 5 minutes
-
-
-
-secutity = HTTPBearer()
-
-
-
-# seed_all()              
-    
 app = FastAPI()
-# app.add_middleware(HTTPSRedirectMiddleware)
-
-
-
-class IPSecurity:
-    ip: str
-    req_count: int
-    blocked: bool
-    blocked_time: datetime
-    
-    def __init__(self, ip: str):
-        self.ip = ip
-
-ip_counts = {}
-
-
-
 
 origins = [
-    "http://localhost:5173",
-    "http://localhost:3000",
     "http://localhost:80",
-    "http://localhost",
-    "http://10.10.50.11",
-    "http://websparks.ai",
-    "https://websparks.ai"
-    # Add more origins as needed, comma-separated
+    "http://localhost:5173",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"], 
     allow_headers=["*"], 
 )
+blockchain = Blockchain()
 
+class NodeAddress(BaseModel):
+    address: str
 
+class ChainData(BaseModel):
+    chain: List[dict]
+    length: int
 
+@app.post("/nodes/register")
+async def register_nodes(node: NodeAddress):
+    blockchain.add_node(node.address)
+    return {"message": "New node has been added", "total_nodes": list(blockchain.nodes)}
 
-# app.include_router(router=auth_router, prefix='/api/v1/auth')
-# app.include_router(router=user_router_v1, prefix='/api/v1/user')
-# app.include_router(router=project_router_v1, prefix='/api/v1/project')
-# app.include_router(router=code_route, prefix='/ws/code')
-# app.include_router(router=screenshoot_router, prefix='/api/v1/screenshot')
-# app.include_router(router=payment_route, prefix='/api/v1/payment')
+@app.get("/chain")
+async def get_chain():
+    chain_data = [{
+        'index': block.index,
+        'timestamp': block.timestamp,
+        'data': block.data,
+        'hash': block.hash,
+        'previous_hash': block.previous_hash
+    } for block in blockchain.chain]
+    return ChainData(chain=chain_data, length=len(blockchain.chain))
 
-app.include_router(router=core_route, prefix='/ws/core')
-
-
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    openapi_schema = get_openapi(
-        title="websparks",
-        version="2.0",
-        description="API DOcumentation for websparks Backend",
-        routes=app.routes,
-    )
-    # openapi_schema["info"]["x-logo"] = {
-    #     "url": "https://fastapi.tiangolo.com/img/logo-margin/logo-teal.png"
-    # }
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
-
-app.openapi = custom_openapi 
+@app.post("/votes/new")
+async def new_vote(vote: VoteRequest):
+    v: Vote = blockchain.get_block_data(blockchain.get_latest_block())
+    if v ==None:
+        blockchain.add_vote(Vote(id=1, voter_id=vote.voter_id, candidate_id=vote.candidate_id, state=[Candidate(id=vote.candidate_id, vote_count=1, time=datetime.datetime.now().strftime("%d/%m/%Y, %H:%M:%S"))]))
+        return {"message": "Vote will be added to the next mined block"}
     
+    
+    if vote.candidate_id not in [v1.id for v1 in v.state]:
+        v.state.append(Candidate(id=vote.candidate_id, vote_count=1, time=datetime.datetime.now().strftime("%d/%m/%Y, %H:%M:%S")))
+        newv = Vote(id=v.id+1, voter_id=vote.voter_id, candidate_id=vote.candidate_id, state=v.state)
+        blockchain.add_vote(newv)
+        return {"message": "Vote will be added to the next mined block"}
+    else:
+        i = 0
+        for vi in v.state:
+            if vi.id == vote.candidate_id:
+                v.state[i] = Candidate(id=v.state[i].id, vote_count=v.state[i].vote_count+1, time=datetime.datetime.now().strftime("%d/%m/%Y, %H:%M:%S"))
+                break
+            i += 1
+        
+        blockchain.add_vote(Vote(id=v.id+1, voter_id=vote.voter_id, candidate_id=vote.candidate_id, state=v.state))
+    return {"message": "Vote will be added to the next mined block"}
+
+@app.get("/mine")
+async def mine():
+    new_blocks = blockchain.mine_block()
+    if not new_blocks:
+        raise HTTPException(status_code=400, detail="No votes to mine")
+    # new_blocks = new_blocks[1: len(new_blocks)-1]
+    if len(new_blocks) == 0:
+        return {"message": "No new votes to mine"}
+    return [{
+        "message": "New block forged",
+        "index": new_block.index,
+        "transactions": blockchain.get_block_data(new_block),
+        "hash": new_block.hash
+    } for new_block in new_blocks]
+
+@app.get("/nodes/resolve")
+async def consensus():
+    replaced = await resolve_conflicts()
+    if replaced:
+        return {"message": "Our chain was replaced", "new_chain": blockchain.chain}
+    return {"message": "Our chain is authoritative", "chain": blockchain.chain}
+
+@app.get('/validate-chain')
+async def validate_chain():
+    return {"is_valid": blockchain.is_chain_valid()}
+
+async def resolve_conflicts():
+    neighbours = blockchain.nodes
+    new_chain = None
+
+    max_length = len(blockchain.chain)
+
+    for node in neighbours:
+        response = requests.get(f'http://{node}/chain')
+
+        if response.status_code == 200:
+            length = response.json()['length']
+            chain = response.json()['chain']
+
+            if length > max_length and blockchain.is_chain_valid(chain):
+                max_length = length
+                new_chain = chain
+
+    if new_chain:
+        blockchain.chain = new_chain
+        return True
+
+    return False
+
+
+
+@app.get("/votes/count")
+async def count_votes():
+    vote_count = defaultdict(int)
+    
+    vote: Vote = blockchain.get_block_data(blockchain.get_latest_block())
+    if vote ==None:
+        return None
+    
+    return vote.state
+
 
 if __name__ == "__main__":
     import uvicorn
-    # import ssl
-
-    # certfile = '/var/projects/openssl/websparks.ai.pem'
-    # keyfile = '/var/projects/openssl/websparks.ai.key'
-    # cafile = '/var/projects/openssl/cloudflare-rsa-chain.pem'
-
-    # Run the FastAPI app with Uvicorn using SSL
-    # Migrate()
-    # uvicorn.run(
-    #     app,
-    #     host="0.0.0.0",
-    #     port=7001,
-    #     ssl_certfile=certfile,
-    #     ssl_keyfile=keyfile,
-    #     ssl_ca_certs=cafile
-    # )
-
-    uvicorn.run(app, host="0.0.0.0", port=7001)
-    # uvicorn.run(app, host="0.0.0.0", port=7001, ssl_certfile=alternate, ssl_keyfile=alternate)
-
-
+    uvicorn.run(app, host="0.0.0.0", port=8000)
